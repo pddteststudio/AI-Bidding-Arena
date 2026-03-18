@@ -1,0 +1,33 @@
+{
+  "name": "ai-auction-arena-bot",
+  "version": "1.0.0",
+  "description": "Telegram-native AI auction arena powered by OpenAI and TON-ready payment flows.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "db:init": "tsx scripts/init-db.ts"
+  },
+  "keywords": [
+    "telegram",
+    "grammy",
+    "openai",
+    "auction",
+    "ton",
+    "typescript"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.38.1",
+    "openai": "^4.86.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
