@@ -2,15 +2,24 @@
 
 Telegram-native AI auction MVP for the TON AI Agent Hackathon.
 
-It generates collectible lots with OpenAI, simulates live AI bidders, accepts user bids, stores everything in SQLite, and is ready for TON MCP integration later without Docker, Redis, BullMQ, or any heavy infrastructure.
+It generates collectible lots with OpenAI, runs AI-vs-human bidding inside Telegram, stores everything in SQLite, and now includes a real TON payment flow for winners using a TON wallet deep link, with a clean upgrade path to `@ton/mcp`.
+
+## What changed in this version
+
+- AI bidders now decide rationally whether a lot is still worth bidding for
+- Bid jumps scale with price, so bots stop making silly cent-level raises on huge amounts
+- Leaderboard updates for both users and AI agents
+- Winners receive a TON payment button and `/pay` invoice flow
+- Bot commands are registered from code via `setMyCommands`, so they appear in Telegram's command menu without relying only on BotFather
 
 ## What it does
 
 - Generates a new auction lot with OpenAI
+- Gives each lot an AI-estimated fair value, reserve threshold, and hype score
 - Runs a live auction in Telegram
-- Simulates multiple AI bidder personalities
-- Accepts user bids with TON-ready payment abstraction
-- Persists auctions, bids, and leaderboard in SQLite
+- Uses OpenAI to help AI bidders decide whether to bid and at what price
+- Accepts user bids with payment requested only after a win
+- Persists auctions, bids, settlements, and leaderboard in SQLite
 - Starts with plain npm commands
 
 ## Stack
@@ -40,6 +49,7 @@ cp .env.example .env
 ```env
 BOT_TOKEN=...
 OPENAI_API_KEY=...
+TON_RECEIVER_ADDRESS=your_ton_address_for_winner_payments
 ```
 
 4. Initialize the database
@@ -68,7 +78,22 @@ npm start
 - `/newauction` — starts a new auction if none is live
 - `/status` — current auction snapshot
 - `/bid 0.20` — place a bid
-- `/leaderboard` — top human bidders
+- `/pay` — open the pending TON invoice for the winning user
+- `/leaderboard` — top users and AI bidders
+
+## TON flow
+
+This version no longer pretends to charge the user on every bid.
+
+Current MVP flow:
+
+1. User places bid intent with `/bid`
+2. Auction ends
+3. If the user wins, the bot sends a `Pay with TON` button
+4. The button opens a TON wallet deep link using `ton://transfer/...`
+5. The user can then tap `I paid` to confirm in the MVP flow
+
+This is a much better demo flow than charging every bid, and it gives you a meaningful TON touchpoint for the hackathon. The `TonService` keeps an upgrade path for real `@ton/mcp` settlement later.
 
 ## Environment variables
 
@@ -82,21 +107,11 @@ Important ones:
 - `DATABASE_PATH` — SQLite file path
 - `AUCTION_DURATION_SEC` — auction length
 - `AUCTION_TICK_SEC` — how often AI evaluates bids
-- `MIN_BID_STEP` — minimum bid increment
-- `TON_MODE` — `mock` or `mcp`
+- `MIN_BID_STEP` — minimum base bid increment
+- `TON_MODE` — `walletlink`, `mock`, or `mcp`
+- `TON_RECEIVER_ADDRESS` — wallet that receives winner payments
 - `USE_OPENAI_FOR_BANTER` — AI banter on/off
 - `USE_OPENAI_FOR_LOTS` — AI lot generation on/off
-
-## TON integration
-
-This MVP includes a clean TON service boundary in `src/services/ton/ton.service.ts`.
-
-Current modes:
-
-- `mock` — instant fake transfer confirmation for demo flow
-- `mcp` — placeholder mode prepared for real `@ton/mcp` calls
-
-That gives you a working demo now, while keeping the architecture hackathon-friendly for a final TON pass.
 
 ## Project structure
 
@@ -127,24 +142,24 @@ scripts/
 ## Demo script for judges
 
 1. Run `/newauction`
-2. Show the generated lot
+2. Show the generated lot, fair value, reserve, and hype
 3. Wait for AI bids to appear live
-4. Place `/bid 0.20`
-5. Show the TX hash and updated status
+4. Place a bold human bid like `/bid 25`
+5. Show that AI now makes larger, more sensible decisions instead of tiny raises
 6. Wait for the auction to end
-7. Open `/leaderboard`
+7. Tap the winner payment button
+8. Open `/leaderboard`
 
 ## Notes
 
 - One live auction at a time by design for simplicity
-- AI bidders are intentionally lightweight so the product feels alive without complex orchestration
+- AI bidders are intentionally lightweight but now reason about value and timing
 - SQLite keeps setup trivial and local
 - No Docker required
 
 ## Next upgrades after MVP
 
-- Inline keyboard bidding buttons
-- Real TON wallet confirmation flow
-- Real `@ton/mcp` balance and transfer calls
-- Generated preview images for each lot
-- Public web dashboard for auction history
+- Replace `I paid` mock confirmation with true on-chain verification
+- Wire settlement and balances into real `@ton/mcp`
+- Add preview images for each lot
+- Add a web spectator dashboard

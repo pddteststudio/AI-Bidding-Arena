@@ -1,6 +1,7 @@
+import { InlineKeyboard } from 'grammy';
 import { db } from '../../db/db';
 import { env } from '../../config/env';
-import { generateAgentBanter, generateLot } from '../ai/ai.service';
+import { decideAgentBid, generateAgentBanter, generateLot } from '../ai/ai.service';
 import { tonService } from '../ton/ton.service';
 import {
   AuctionAgentProfile,
@@ -9,29 +10,31 @@ import {
   AuctionWinner,
   BidRecord,
   LeaderboardEntry,
+  PaymentSettlementRecord,
   PlaceBidInput,
 } from './auction.types';
 
 export interface AuctionBroadcast {
   type: 'auction_started' | 'bid_placed' | 'auction_ended' | 'auction_tick';
   text: string;
+  replyMarkup?: InlineKeyboard;
 }
 
 const AGENTS: AuctionAgentProfile[] = [
-  { id: 'ai_aggro', name: 'AggroBot', emoji: '🔥', behavior: 'aggro', risk: 0.92, patience: 0.45, tone: 'cocky, aggressive, fast-talking' },
-  { id: 'ai_sniper', name: 'SniperBot', emoji: '🎯', behavior: 'sniper', risk: 0.78, patience: 0.95, tone: 'cold, precise, quiet confidence' },
-  { id: 'ai_whale', name: 'WhaleMind', emoji: '🐋', behavior: 'value', risk: 0.66, patience: 0.8, tone: 'rich, calm, superior' },
-  { id: 'ai_chaos', name: 'ChaosNode', emoji: '⚡', behavior: 'chaotic', risk: 0.83, patience: 0.55, tone: 'unpredictable, playful, dramatic' },
+  { id: 'ai_aggro', name: 'AggroBot', emoji: '🔥', behavior: 'aggro', risk: 0.94, patience: 0.4, tone: 'cocky, aggressive, fast-talking' },
+  { id: 'ai_sniper', name: 'SniperBot', emoji: '🎯', behavior: 'sniper', risk: 0.8, patience: 0.96, tone: 'cold, precise, quiet confidence' },
+  { id: 'ai_whale', name: 'WhaleMind', emoji: '🐋', behavior: 'value', risk: 0.68, patience: 0.82, tone: 'rich, calm, superior' },
+  { id: 'ai_chaos', name: 'ChaosNode', emoji: '⚡', behavior: 'chaotic', risk: 0.86, patience: 0.58, tone: 'unpredictable, playful, dramatic' },
 ];
 
 const insertAuctionStmt = db.prepare(`
   INSERT INTO auctions (
     lot_title, lot_description, lot_style, lot_origin_story,
+    estimated_value_ton, reserve_price_ton, hype_score,
     starting_price, current_price, highest_bidder_id, highest_bidder_name,
     status, started_at, ends_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?)
 `);
-
 const getLiveAuctionStmt = db.prepare(`SELECT * FROM auctions WHERE status = 'live' ORDER BY id DESC LIMIT 1`);
 const getAuctionByIdStmt = db.prepare(`SELECT * FROM auctions WHERE id = ?`);
 const listBidsByAuctionStmt = db.prepare(`SELECT * FROM bids WHERE auction_id = ? ORDER BY id ASC`);
@@ -50,25 +53,34 @@ const closeAuctionStmt = db.prepare(`
   WHERE id = ?
 `);
 const upsertUserStmt = db.prepare(`
-  INSERT INTO users (telegram_id, username, wins, total_volume, total_bids, created_at, updated_at)
-  VALUES (?, ?, 0, 0, 0, ?, ?)
-  ON CONFLICT(telegram_id) DO UPDATE SET username = excluded.username, updated_at = excluded.updated_at
+  INSERT INTO users (telegram_id, username, entity_type, wins, total_volume, total_bids, created_at, updated_at)
+  VALUES (?, ?, ?, 0, 0, 0, ?, ?)
+  ON CONFLICT(telegram_id) DO UPDATE SET username = excluded.username, entity_type = excluded.entity_type, updated_at = excluded.updated_at
 `);
-const recordBidUserStatsStmt = db.prepare(`
+const recordBidStatsStmt = db.prepare(`
   UPDATE users SET total_bids = total_bids + 1, total_volume = total_volume + ?, updated_at = ? WHERE telegram_id = ?
 `);
 const recordWinStmt = db.prepare(`
   UPDATE users SET wins = wins + 1, updated_at = ? WHERE telegram_id = ?
 `);
 const leaderboardStmt = db.prepare(`
-  SELECT telegram_id, username, wins, total_volume, total_bids
+  SELECT telegram_id, username, entity_type, wins, total_volume, total_bids
   FROM users
   ORDER BY wins DESC, total_volume DESC, total_bids DESC, username ASC
   LIMIT ?
 `);
+const insertSettlementStmt = db.prepare(`
+  INSERT INTO payment_settlements (
+    auction_id, winner_id, winner_name, amount, status, payment_address, payment_memo, payment_url, tx_hash, created_at, paid_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const getPendingSettlementByWinnerStmt = db.prepare(`
+  SELECT * FROM payment_settlements WHERE winner_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1
+`);
 
 export class AuctionService {
   private tickTimer: NodeJS.Timeout | null = null;
+  private tickInFlight = false;
   private listeners: Array<(payload: AuctionBroadcast) => Promise<void> | void> = [];
 
   subscribe(listener: (payload: AuctionBroadcast) => Promise<void> | void): void {
@@ -84,14 +96,18 @@ export class AuctionService {
     const now = new Date();
     const endsAt = new Date(now.getTime() + env.auctionDurationSec * 1000);
     const lot = await generateLot();
+    const openingPrice = this.computeOpeningPrice(lot.estimatedValueTon, lot.reservePriceTon, lot.hypeScore);
 
     const result = insertAuctionStmt.run(
       lot.title,
       lot.description,
       lot.style,
       lot.originStory,
-      env.auctionStartPrice,
-      env.auctionStartPrice,
+      lot.estimatedValueTon,
+      lot.reservePriceTon,
+      lot.hypeScore,
+      openingPrice,
+      openingPrice,
       null,
       null,
       now.toISOString(),
@@ -100,13 +116,8 @@ export class AuctionService {
 
     const auctionId = Number(result.lastInsertRowid);
     const snapshot = this.getSnapshot(auctionId)!;
-
     this.startTicking();
-    await this.broadcast({
-      type: 'auction_started',
-      text: this.renderAuctionStart(snapshot),
-    });
-
+    await this.broadcast({ type: 'auction_started', text: this.renderAuctionStart(snapshot) });
     return snapshot;
   }
 
@@ -121,101 +132,123 @@ export class AuctionService {
     return { auction, bids };
   }
 
-  async placeUserBid(bidderId: string, bidderName: string, amount: number): Promise<{ snapshot: AuctionSnapshot; txHash: string }> {
-    const liveAuction = this.getLiveAuction();
-    if (!liveAuction) {
-      throw new Error('No live auction. Start one with /newauction.');
-    }
+  getPendingSettlementForWinner(winnerId: string): PaymentSettlementRecord | null {
+    return (getPendingSettlementByWinnerStmt.get(winnerId) as PaymentSettlementRecord | undefined) ?? null;
+  }
 
-    const minAllowed = Number((liveAuction.current_price + env.minBidStep).toFixed(2));
-    if (amount < minAllowed) {
-      throw new Error(`Minimum allowed bid is ${minAllowed.toFixed(2)} TON.`);
-    }
-
+  async placeUserBid(bidderId: string, bidderName: string, amount: number): Promise<{ snapshot: AuctionSnapshot; previousPrice: number; minAllowed: number }> {
     const balance = await tonService.getBalance(bidderId);
     if (balance < amount) {
       throw new Error(`Insufficient balance. Available: ${balance.toFixed(2)} TON.`);
     }
 
-    const transfer = await tonService.createBidCharge(bidderId, amount);
-    if (!transfer.success) {
-      throw new Error('TON transfer could not be confirmed.');
-    }
-
-    this.persistBid({
-      auctionId: liveAuction.id,
+    const result = this.placeBid({
       bidderId,
       bidderName,
       bidderType: 'user',
       amount,
-      txHash: transfer.txHash,
+      txHash: null,
     });
 
-    const snapshot = this.getSnapshot(liveAuction.id)!;
     await this.broadcast({
       type: 'bid_placed',
-      text: this.renderUserBidMessage(snapshot, bidderName, amount, transfer.txHash),
+      text: this.renderUserBidMessage(result.snapshot, bidderName, amount, result.previousPrice, result.minAllowed),
     });
 
-    return { snapshot, txHash: transfer.txHash };
+    return result;
   }
 
   getLeaderboard(limit = 10): LeaderboardEntry[] {
     return leaderboardStmt.all(limit) as LeaderboardEntry[];
   }
 
-  private persistBid(input: PlaceBidInput): void {
-    const now = new Date().toISOString();
+  getNextMinimumBid(currentPrice: number): number {
+    return this.getMinAllowedBid(currentPrice);
+  }
 
+  private placeBid(input: Omit<PlaceBidInput, 'auctionId'>): { snapshot: AuctionSnapshot; previousPrice: number; minAllowed: number } {
+    const liveAuction = this.getLiveAuction();
+    if (!liveAuction) {
+      throw new Error('No live auction. Start one with /newauction.');
+    }
+    if (liveAuction.status !== 'live') {
+      throw new Error('Auction is not active.');
+    }
+    if (Date.now() >= new Date(liveAuction.ends_at).getTime()) {
+      throw new Error('Auction is already ending. Please wait for settlement.');
+    }
+
+    const previousPrice = liveAuction.current_price;
+    const minAllowed = this.getMinAllowedBid(previousPrice);
+
+    if (input.amount < minAllowed) {
+      throw new Error(`Bid rejected. Current highest bid: ${previousPrice.toFixed(2)} TON. Minimum allowed next bid: ${minAllowed.toFixed(2)} TON.`);
+    }
+
+    if (liveAuction.highest_bidder_id === input.bidderId) {
+      throw new Error('You are already the highest bidder. Wait for a challenge.');
+    }
+
+    const now = new Date().toISOString();
     db.transaction(() => {
       insertBidStmt.run(
-        input.auctionId,
+        liveAuction.id,
         input.bidderId,
         input.bidderName,
         input.bidderType,
-        input.amount,
+        Number(input.amount.toFixed(2)),
         input.txHash ?? null,
         now,
       );
 
-      updateAuctionBidStmt.run(input.amount, input.bidderId, input.bidderName, input.auctionId);
-
-      upsertUserStmt.run(input.bidderId, input.bidderName, now, now);
-      if (input.bidderType === 'user') {
-        recordBidUserStatsStmt.run(input.amount, now, input.bidderId);
-      }
+      updateAuctionBidStmt.run(Number(input.amount.toFixed(2)), input.bidderId, input.bidderName, liveAuction.id);
+      upsertUserStmt.run(input.bidderId, input.bidderName, input.bidderType, now, now);
+      recordBidStatsStmt.run(Number(input.amount.toFixed(2)), now, input.bidderId);
     })();
+
+    return {
+      snapshot: this.getSnapshot(liveAuction.id)!,
+      previousPrice,
+      minAllowed,
+    };
   }
 
   private startTicking(): void {
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
-      this.tickTimer = null;
     }
 
     this.tickTimer = setInterval(async () => {
-      const liveAuction = this.getLiveAuction();
-      if (!liveAuction) {
-        this.stopTicking();
-        return;
-      }
+      if (this.tickInFlight) return;
+      this.tickInFlight = true;
+      try {
+        const liveAuction = this.getLiveAuction();
+        if (!liveAuction) {
+          this.stopTicking();
+          return;
+        }
 
-      const now = Date.now();
-      const msLeft = new Date(liveAuction.ends_at).getTime() - now;
-      if (msLeft <= 0) {
-        await this.finishAuction(liveAuction.id);
-        return;
-      }
+        const msLeft = new Date(liveAuction.ends_at).getTime() - Date.now();
+        if (msLeft <= 0) {
+          await this.finishAuction(liveAuction.id);
+          return;
+        }
 
-      const aiAction = await this.tryAiBid(liveAuction);
-      const fresh = this.getSnapshot(liveAuction.id)!;
-      const secsLeft = Math.max(0, Math.ceil((new Date(fresh.auction.ends_at).getTime() - Date.now()) / 1000));
-      await this.broadcast({
-        type: 'auction_tick',
-        text: aiAction
-          ? `${aiAction}\n\n⏳ ${secsLeft}s left.`
-          : `⏳ Auction still live: ${secsLeft}s left. Current price: ${fresh.auction.current_price.toFixed(2)} TON.`,
-      });
+        const aiAction = await this.tryAiBid(liveAuction.id);
+        const fresh = this.getSnapshot(liveAuction.id);
+        if (!fresh) return;
+        const secsLeft = Math.max(0, Math.ceil((new Date(fresh.auction.ends_at).getTime() - Date.now()) / 1000));
+        await this.broadcast({
+          type: 'auction_tick',
+          text: aiAction
+            ? `${aiAction}
+
+⏳ ${secsLeft}s left.`
+            : `⏳ Auction still live: ${secsLeft}s left. Current price: ${fresh.auction.current_price.toFixed(2)} TON.`,
+        });
+      } finally {
+        this.tickInFlight = false;
+      }
     }, env.auctionTickSec * 1000);
   }
 
@@ -226,68 +259,135 @@ export class AuctionService {
     }
   }
 
-  private async tryAiBid(liveAuction: AuctionRecord): Promise<string | null> {
-    const msLeft = new Date(liveAuction.ends_at).getTime() - Date.now();
-    const secondsLeft = msLeft / 1000;
+  private buildAgentPrivateMax(auction: AuctionRecord, agent: AuctionAgentProfile): number {
+    const fair = auction.estimated_value_ton;
+    const mood = 1 + ((auction.hype_score - 70) / 1000);
+    let multiplier = 1;
+    switch (agent.behavior) {
+      case 'aggro':
+        multiplier = 1.16;
+        break;
+      case 'sniper':
+        multiplier = 1.05;
+        break;
+      case 'value':
+        multiplier = 0.92;
+        break;
+      case 'chaotic':
+        multiplier = 1.0;
+        break;
+    }
+    return Number((fair * multiplier * mood).toFixed(2));
+  }
 
+  private async tryAiBid(auctionId: number): Promise<string | null> {
+    const snapshot = this.getSnapshot(auctionId);
+    if (!snapshot) return null;
+    const auction = snapshot.auction;
+    const secondsLeft = Math.max(0, (new Date(auction.ends_at).getTime() - Date.now()) / 1000);
     const shuffled = [...AGENTS].sort(() => Math.random() - 0.5);
-    for (const agent of shuffled) {
-      if (!this.shouldAgentBid(agent, liveAuction.current_price, secondsLeft)) continue;
 
-      const amount = this.calculateAiBid(agent, liveAuction.current_price, secondsLeft);
-      this.persistBid({
-        auctionId: liveAuction.id,
-        bidderId: agent.id,
-        bidderName: agent.name,
-        bidderType: 'ai',
-        amount,
-        txHash: null,
+    for (const agent of shuffled) {
+      const currentSnapshot = this.getSnapshot(auctionId);
+      if (!currentSnapshot) return null;
+      const live = currentSnapshot.auction;
+      const minAllowedBid = this.getMinAllowedBid(live.current_price);
+      const privateMaxBid = this.buildAgentPrivateMax(live, agent);
+      const isLeader = live.highest_bidder_id === agent.id;
+
+      const decision = await decideAgentBid({
+        agent,
+        lot: {
+          title: live.lot_title,
+          description: live.lot_description,
+          estimatedValueTon: live.estimated_value_ton,
+          reservePriceTon: live.reserve_price_ton,
+          hypeScore: live.hype_score,
+        },
+        currentPrice: live.current_price,
+        minAllowedBid,
+        secondsLeft,
+        highestBidderName: live.highest_bidder_name,
+        recentBids: currentSnapshot.bids,
+        privateMaxBid,
+        isLeader,
       });
 
-      const banter = await generateAgentBanter(agent, amount, liveAuction.lot_title);
-      return `${agent.emoji} <b>${agent.name}</b> bids <b>${amount.toFixed(2)} TON</b>\n<i>${escapeHtml(banter)}</i>`;
+      if (!decision.shouldBid || !decision.bidAmount) continue;
+      const boundedAmount = this.normalizeAgentBidAmount(agent, live.current_price, minAllowedBid, decision.bidAmount, privateMaxBid, secondsLeft, live.estimated_value_ton);
+      if (boundedAmount === null) continue;
+
+      try {
+        this.placeBid({
+          bidderId: agent.id,
+          bidderName: agent.name,
+          bidderType: 'ai',
+          amount: boundedAmount,
+          txHash: null,
+        });
+      } catch {
+        continue;
+      }
+
+      const banter = await generateAgentBanter(agent, boundedAmount, live.lot_title);
+      return `${agent.emoji} <b>${agent.name}</b> bids <b>${boundedAmount.toFixed(2)} TON</b>
+<i>${escapeHtml(decision.reason)} • ${escapeHtml(banter)}</i>`;
     }
 
     return null;
   }
 
-  private shouldAgentBid(agent: AuctionAgentProfile, currentPrice: number, secondsLeft: number): boolean {
-    const urgencyBoost = secondsLeft < 20 ? 0.2 : secondsLeft < 40 ? 0.1 : 0;
-    const pricePressure = currentPrice > 1.2 ? -0.15 : currentPrice > 0.7 ? -0.07 : 0;
-    let chance = agent.risk * 0.45 + agent.patience * 0.2 + urgencyBoost + pricePressure;
+  private normalizeAgentBidAmount(
+    agent: AuctionAgentProfile,
+    currentPrice: number,
+    minAllowed: number,
+    requestedAmount: number,
+    privateMaxBid: number,
+    secondsLeft: number,
+    fairValue: number,
+  ): number | null {
+    if (minAllowed > privateMaxBid) return null;
 
-    if (agent.behavior === 'sniper' && secondsLeft > 35) chance -= 0.25;
-    if (agent.behavior === 'aggro' && secondsLeft > 35) chance += 0.12;
-    if (agent.behavior === 'value' && currentPrice > 0.9) chance -= 0.18;
-    if (agent.behavior === 'chaotic') chance += Math.random() * 0.22 - 0.08;
+    let amount = Math.max(minAllowed, Number(requestedAmount.toFixed(2)));
+    const early = secondsLeft > env.auctionDurationSec * 0.55;
+    const late = secondsLeft <= 15;
 
-    return Math.random() < Math.max(0.08, Math.min(0.82, chance));
+    if (agent.behavior === 'chaotic') {
+      amount = currentPrice >= fairValue * 0.55 ? minAllowed + 1 : Math.max(amount, currentPrice + Math.max(currentPrice * 0.05, fairValue * 0.05));
+    } else if (agent.behavior === 'aggro' && early) {
+      amount = Math.max(amount, currentPrice + Math.max(currentPrice * 0.08, fairValue * 0.08));
+    } else if (agent.behavior === 'value') {
+      amount = Math.max(minAllowed, Math.min(amount, currentPrice + Math.max(currentPrice * 0.03, fairValue * 0.025)));
+    } else if (agent.behavior === 'sniper' && late) {
+      amount = Math.max(minAllowed, Math.min(amount, minAllowed + Math.max(currentPrice * 0.01, 1)));
+    }
+
+    amount = Number(amount.toFixed(2));
+    if (amount > privateMaxBid) {
+      amount = Number(privateMaxBid.toFixed(2));
+    }
+    if (amount < minAllowed || amount > privateMaxBid) return null;
+    return amount;
   }
 
-  private calculateAiBid(agent: AuctionAgentProfile, currentPrice: number, secondsLeft: number): number {
-    let minJump = env.minBidStep;
-    let maxJump = env.minBidStep + 0.06;
+  private getMinAllowedBid(currentPrice: number): number {
+    let pct = 0.03;
+    if (currentPrice < 10) pct = 0.15;
+    else if (currentPrice < 100) pct = 0.1;
+    else if (currentPrice < 1000) pct = 0.06;
+    const absoluteStep = Math.max(env.minBidStep, Number((currentPrice * pct).toFixed(2)));
+    return Number((currentPrice + absoluteStep).toFixed(2));
+  }
 
-    if (agent.behavior === 'aggro') {
-      maxJump += 0.06;
-    }
-    if (agent.behavior === 'sniper' && secondsLeft < 25) {
-      minJump += 0.02;
-      maxJump += 0.03;
-    }
-    if (agent.behavior === 'value') {
-      maxJump -= 0.02;
-    }
-
-    const jump = minJump + Math.random() * Math.max(0.01, maxJump - minJump);
-    return Number((currentPrice + jump).toFixed(2));
+  private computeOpeningPrice(fairValue: number, reservePrice: number, hypeScore: number): number {
+    const baseMultiplier = hypeScore >= 85 ? 0.62 : hypeScore >= 75 ? 0.56 : 0.5;
+    const opening = Math.max(fairValue * baseMultiplier, reservePrice * 0.7);
+    return Number(opening.toFixed(2));
   }
 
   async finishAuction(auctionId: number): Promise<AuctionSnapshot> {
     const snapshot = this.getSnapshot(auctionId);
-    if (!snapshot) {
-      throw new Error('Auction not found.');
-    }
+    if (!snapshot) throw new Error('Auction not found.');
     if (snapshot.auction.status === 'ended') {
       this.stopTicking();
       return snapshot;
@@ -295,6 +395,7 @@ export class AuctionService {
 
     const winner = this.resolveWinner(snapshot.bids);
     const endedAt = new Date().toISOString();
+    let replyMarkup: InlineKeyboard | undefined;
 
     db.transaction(() => {
       closeAuctionStmt.run(
@@ -305,19 +406,41 @@ export class AuctionService {
         auctionId,
       );
 
-      if (winner && winner.bidderType === 'user') {
-        upsertUserStmt.run(winner.bidderId, winner.bidderName, endedAt, endedAt);
+      if (winner) {
+        upsertUserStmt.run(winner.bidderId, winner.bidderName, winner.bidderType, endedAt, endedAt);
         recordWinStmt.run(endedAt, winner.bidderId);
+      }
+
+      if (winner && winner.bidderType === 'user') {
+        const payment = tonService.buildPaymentRequest({
+          userId: winner.bidderId,
+          amountTon: winner.amount,
+          auctionId,
+        });
+
+        insertSettlementStmt.run(
+          auctionId,
+          winner.bidderId,
+          winner.bidderName,
+          winner.amount,
+          'pending',
+          payment.address,
+          payment.memo,
+          payment.url,
+          null,
+          endedAt,
+          null,
+        );
       }
     })();
 
+    if (winner?.bidderType === 'user') {
+      replyMarkup = new InlineKeyboard().url('💎 Pay with TON', this.getPendingSettlementForWinner(winner.bidderId)?.payment_url ?? 'https://ton.org');
+    }
+
     this.stopTicking();
     const finalSnapshot = this.getSnapshot(auctionId)!;
-    await this.broadcast({
-      type: 'auction_ended',
-      text: this.renderAuctionEnd(finalSnapshot, winner),
-    });
-
+    await this.broadcast({ type: 'auction_ended', text: this.renderAuctionEnd(finalSnapshot, winner), replyMarkup });
     return finalSnapshot;
   }
 
@@ -334,6 +457,7 @@ export class AuctionService {
 
   private renderAuctionStart(snapshot: AuctionSnapshot): string {
     const { auction } = snapshot;
+    const nextMin = this.getMinAllowedBid(auction.current_price);
     return [
       '🎉 <b>New AI Auction Started</b>',
       '',
@@ -342,23 +466,29 @@ export class AuctionService {
       `📜 ${escapeHtml(auction.lot_description)}`,
       `✨ ${escapeHtml(auction.lot_origin_story)}`,
       '',
+      `🧠 AI fair value: <b>${auction.estimated_value_ton.toFixed(2)} TON</b>`,
+      `🔐 Reserve threshold: <b>${auction.reserve_price_ton.toFixed(2)} TON</b>`,
+      `🔥 Hype score: <b>${auction.hype_score}/100</b>`,
       `💰 Starting price: <b>${auction.starting_price.toFixed(2)} TON</b>`,
-      `📈 Min step: <b>${env.minBidStep.toFixed(2)} TON</b>`,
+      `📈 Next minimum bid: <b>${nextMin.toFixed(2)} TON</b>`,
       `⏱ Ends in: <b>${env.auctionDurationSec}s</b>`,
       '',
-      'Use <code>/bid 0.20</code> to outbid the arena.',
+      `Use <code>/bid ${nextMin.toFixed(2)}</code> to outbid the arena.`,
     ].join('\n');
   }
 
-  private renderUserBidMessage(snapshot: AuctionSnapshot, bidderName: string, amount: number, txHash: string): string {
+  private renderUserBidMessage(snapshot: AuctionSnapshot, bidderName: string, amount: number, previousPrice: number, minAllowed: number): string {
+    const nextMin = this.getMinAllowedBid(amount);
     return [
       '💥 <b>User bid accepted</b>',
       '',
       `👤 ${escapeHtml(bidderName)} pushed the price to <b>${amount.toFixed(2)} TON</b>`,
-      `🧾 TX: <code>${txHash}</code>`,
       `🏷 Lot: <b>${escapeHtml(snapshot.auction.lot_title)}</b>`,
+      `🧾 Previous highest bid: <b>${previousPrice.toFixed(2)} TON</b>`,
+      `📉 Minimum required bid was: <b>${minAllowed.toFixed(2)} TON</b>`,
+      `📈 Next minimum bid: <b>${nextMin.toFixed(2)} TON</b>`,
       '',
-      'AI agents are recalculating…',
+      'No TON is charged yet. Payment is requested only if you win.',
     ].join('\n');
   }
 
@@ -380,7 +510,7 @@ export class AuctionService {
       `💰 Winning bid: <b>${winner.amount.toFixed(2)} TON</b>`,
       '',
       winner.bidderType === 'user'
-        ? '🎁 The user beat the machine swarm.'
+        ? '💎 Complete payment using the TON button below.'
         : '🤖 AI defended the lot this round.',
     ].join('\n');
   }
@@ -393,10 +523,7 @@ export class AuctionService {
 }
 
 function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 export const auctionService = new AuctionService();

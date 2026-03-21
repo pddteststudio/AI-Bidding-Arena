@@ -1,11 +1,15 @@
 export type AuctionStatus = 'scheduled' | 'live' | 'ended';
 export type BidderType = 'user' | 'ai';
+export type SettlementStatus = 'pending' | 'paid' | 'expired';
 
 export interface GeneratedLot {
   title: string;
   description: string;
   style: string;
   originStory: string;
+  estimatedValueTon: number;
+  reservePriceTon: number;
+  hypeScore: number;
 }
 
 export interface AuctionRecord {
@@ -14,6 +18,9 @@ export interface AuctionRecord {
   lot_description: string;
   lot_style: string;
   lot_origin_story: string;
+  estimated_value_ton: number;
+  reserve_price_ton: number;
+  hype_score: number;
   starting_price: number;
   current_price: number;
   highest_bidder_id: string | null;
@@ -72,7 +79,29 @@ export interface AuctionAgentProfile {
 export interface LeaderboardEntry {
   telegram_id: string;
   username: string;
+  entity_type: BidderType;
   wins: number;
   total_volume: number;
   total_bids: number;
+}
+
+export interface PaymentSettlementRecord {
+  id: number;
+  auction_id: number;
+  winner_id: string;
+  winner_name: string;
+  amount: number;
+  status: SettlementStatus;
+  payment_address: string;
+  payment_memo: string;
+  payment_url: string;
+  tx_hash: string | null;
+  created_at: string;
+  paid_at: string | null;
+}
+
+export interface AgentBidDecision {
+  shouldBid: boolean;
+  bidAmount: number | null;
+  reason: string;
 }

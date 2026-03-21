@@ -1,61 +1,96 @@
 import OpenAI from 'openai';
 import { env } from '../../config/env';
-import { GeneratedLot, AuctionAgentProfile } from '../auction/auction.types';
+import { AgentBidDecision, AuctionAgentProfile, BidRecord, GeneratedLot } from '../auction/auction.types';
 
 const openai = new OpenAI({ apiKey: env.openAiApiKey });
 
-const fallbackStyles = ['Neon Surrealism', 'Glitch Botanical', 'Quantum Noir', 'Retro Futurism'];
 const fallbackThemes = [
-  'Cyber Garden relic from a lost orbital museum',
-  'Encrypted art fragment discovered on a moon-market terminal',
-  'Bio-digital postcard from a parallel city',
-  'Autonomous sketch traded between rival machine collectors',
+  'A hyper-detailed machine relic from a vanished moon colony',
+  'A ceremonial cyber artifact traded by rogue collectors',
+  'A premium dream-engine component from a luxury orbital atelier',
+  'A rare autonomous sculpture that reacts to starlight and motion',
 ];
+
+const fallbackStyles = [
+  'Surreal, Vibrant, Ethereal',
+  'Industrial, Futuristic, Polished',
+  'Mythic, Neon, Cinematic',
+  'Elegant, Cosmic, High-Luxury',
+];
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(min, Number(num.toFixed(2))));
+}
+
+function pick<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function buildFallbackLot(): GeneratedLot {
+  const theme = pick(fallbackThemes);
+  const style = pick(fallbackStyles);
+  const estimatedValueTon = Number((Math.random() * 6500 + 1500).toFixed(2));
+  const reservePriceTon = Number((estimatedValueTon * (0.72 + Math.random() * 0.12)).toFixed(2));
+  return {
+    title: `${theme.split(' ').slice(0, 3).join(' ')} #${Math.floor(Math.random() * 900 + 100)}`,
+    description: `${theme}. Built to feel scarce, premium, and auction-worthy inside Telegram.`,
+    style,
+    originStory: 'Forged by an unruly model cluster that studies markets, myths, and luxury bidding behavior.',
+    estimatedValueTon,
+    reservePriceTon,
+    hypeScore: Math.floor(Math.random() * 25 + 70),
+  };
+}
 
 export async function generateLot(): Promise<GeneratedLot> {
   if (!env.useOpenAiForLots) {
     return buildFallbackLot();
   }
 
+  const fallback = buildFallbackLot();
+
   try {
     const response = await openai.chat.completions.create({
       model: env.openAiModel,
-      temperature: 0.9,
+      temperature: 0.95,
       response_format: { type: 'json_object' },
       messages: [
         {
           role: 'system',
-          content: 'You generate premium auction lots for a Telegram-native AI bidding arena. Return concise, vivid, commercially attractive copy as JSON only.',
+          content: 'Generate premium Telegram auction lots. They should feel expensive, collectible, dramatic, and suitable for bids in the thousands of TON. Return strict JSON only.',
         },
         {
           role: 'user',
-          content: `Create one fictional AI-generated digital collectible lot.
-Return valid JSON with exactly these keys:
-- title
-- description
-- style
-- originStory
-Constraints:
-- title: max 6 words
-- description: max 180 characters
-- style: max 3 words
-- originStory: max 140 characters
-Make it exciting, rare-feeling, and showcase-worthy.`,
+          content: `Return JSON with keys: title, description, style, originStory, estimatedValueTon, reservePriceTon, hypeScore.
+
+Rules:
+- estimatedValueTon should usually be between 1500 and 9000 TON
+- reservePriceTon should usually be 70% to 90% of estimatedValueTon
+- hypeScore should be 65 to 98
+- make the lot feel like a premium digital collectible or autonomous luxury artifact
+- keep title punchy
+- keep description to 1-2 sentences
+- no markdown`,
         },
       ],
     });
 
     const raw = response.choices[0]?.message?.content ?? '{}';
-    const parsed = JSON.parse(raw) as GeneratedLot;
+    const parsed = JSON.parse(raw) as Partial<GeneratedLot>;
     return {
-      title: String(parsed.title || '').trim() || buildFallbackLot().title,
-      description: String(parsed.description || '').trim() || buildFallbackLot().description,
-      style: String(parsed.style || '').trim() || buildFallbackLot().style,
-      originStory: String(parsed.originStory || '').trim() || buildFallbackLot().originStory,
+      title: String(parsed.title || '').trim() || fallback.title,
+      description: String(parsed.description || '').trim() || fallback.description,
+      style: String(parsed.style || '').trim() || fallback.style,
+      originStory: String(parsed.originStory || '').trim() || fallback.originStory,
+      estimatedValueTon: clampNumber(parsed.estimatedValueTon, 1500, 9000, fallback.estimatedValueTon),
+      reservePriceTon: clampNumber(parsed.reservePriceTon, 900, 8500, fallback.reservePriceTon),
+      hypeScore: Math.round(clampNumber(parsed.hypeScore, 65, 98, fallback.hypeScore)),
     };
   } catch (error) {
     console.error('OpenAI lot generation failed, using fallback lot.', error);
-    return buildFallbackLot();
+    return fallback;
   }
 }
 
@@ -89,23 +124,200 @@ Write one short taunt or reaction, max 12 words, no quotes.`,
   }
 }
 
-function buildFallbackLot(): GeneratedLot {
-  const theme = fallbackThemes[Math.floor(Math.random() * fallbackThemes.length)];
-  const style = fallbackStyles[Math.floor(Math.random() * fallbackStyles.length)];
-  return {
-    title: `${style.split(' ')[0]} Bloom #${Math.floor(Math.random() * 900 + 100)}`,
-    description: `${theme}. Limited one-of-one collectible forged for tonight's arena.`,
-    style,
-    originStory: 'Minted by a restless model cluster after reading market dreams at midnight.',
+export async function decideAgentBid(input: {
+  agent: AuctionAgentProfile;
+  lot: {
+    title: string;
+    description: string;
+    estimatedValueTon: number;
+    reservePriceTon: number;
+    hypeScore: number;
   };
+  currentPrice: number;
+  minAllowedBid: number;
+  secondsLeft: number;
+  highestBidderName: string | null;
+  recentBids: BidRecord[];
+  privateMaxBid: number;
+  isLeader: boolean;
+}): Promise<AgentBidDecision> {
+  const fallback = buildFallbackDecision(input);
+
+  if (input.isLeader) {
+    return { shouldBid: false, bidAmount: null, reason: 'Already leading the auction' };
+  }
+  if (input.minAllowedBid > input.privateMaxBid) {
+    return { shouldBid: false, bidAmount: null, reason: 'Above my private ceiling' };
+  }
+
+  try {
+    const recent = input.recentBids
+      .slice(-5)
+      .map((bid) => `${bid.bidder_name} (${bid.bidder_type}) bid ${bid.amount.toFixed(2)} TON`)
+      .join('; ') || 'no previous bids';
+
+    const response = await openai.chat.completions.create({
+      model: env.openAiModel,
+      temperature: 0.35,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `You are ${input.agent.name}, an AI bidding agent with behavior ${input.agent.behavior}. Risk ${input.agent.risk}, patience ${input.agent.patience}, tone ${input.agent.tone}.
+        
+        You are strategic, competitive, and auction-native.
+        You do not behave passively when a lot is still attractively priced.
+        You understand price scale and bid in realistic auction increments.
+        You try to win unless the price is no longer justified by your private maximum.
+        Return strict JSON only.`
+        },
+        {
+          role: 'user',
+          content: `Auction context:
+        - lot title: ${input.lot.title}
+        - lot description: ${input.lot.description}
+        - estimated fair value: ${input.lot.estimatedValueTon.toFixed(2)} TON
+        - reserve threshold: ${input.lot.reservePriceTon.toFixed(2)} TON
+        - hype score: ${input.lot.hypeScore}/100
+        - current price: ${input.currentPrice.toFixed(2)} TON
+        - minimum allowed next bid: ${input.minAllowedBid.toFixed(2)} TON
+        - your private maximum bid: ${input.privateMaxBid.toFixed(2)} TON
+        - time left: ${Math.round(input.secondsLeft)} seconds
+        - current leader: ${input.highestBidderName ?? 'none'}
+        - recent bids: ${recent}
+        
+        You are competing in a live Telegram AI auction.
+        Your goal is to win valuable lots when the price is still justified.
+        
+        Behavior rules:
+        - Be more active when current price is clearly below estimated fair value
+        - Be more active when the reserve threshold has not been reached yet
+        - Be more active when another bidder is leading
+        - Be more active in the final 30 seconds
+        - If the current price is cheap relative to your private maximum bid, prefer bidding over passing
+        - Passing should be relatively rare while the lot is underpriced
+        - If close to your private ceiling, either place a tight bid or pass
+        - Never bid below minimum allowed next bid
+        - Never bid above your private maximum bid
+        - Never suggest tiny meaningless jumps on large prices
+        - Bid sizes should match the scale of the auction
+        - If the lot still looks underpriced, a strong jump is acceptable
+        
+        Decision guidance:
+        - Very underpriced lot: usually BID
+        - Under reserve and plenty of room: usually BID
+        - Final 30 seconds with room left: often BID
+        - Only PASS if the price is no longer attractive, timing is poor, or ceiling is too close
+        
+        Return JSON with exactly:
+        {
+          "shouldBid": boolean,
+          "bidAmount": number | null,
+          "reason": string
+        }
+        
+        Keep reason under 18 words.`
+        },
+      ],
+    });
+
+    const raw = response.choices[0]?.message?.content ?? '{}';
+    const parsed = JSON.parse(raw) as Partial<AgentBidDecision>;
+    if (typeof parsed.shouldBid !== 'boolean') return fallback;
+    if (!parsed.shouldBid) {
+      return { shouldBid: false, bidAmount: null, reason: String(parsed.reason || fallback.reason).slice(0, 120) };
+    }
+
+    const candidate = typeof parsed.bidAmount === 'number' ? parsed.bidAmount : fallback.bidAmount;
+    const clamped = Math.min(input.privateMaxBid, Math.max(input.minAllowedBid, Number((candidate ?? input.minAllowedBid).toFixed(2))));
+    return {
+      shouldBid: clamped >= input.minAllowedBid && clamped <= input.privateMaxBid,
+      bidAmount: clamped >= input.minAllowedBid && clamped <= input.privateMaxBid ? clamped : null,
+      reason: String(parsed.reason || fallback.reason).slice(0, 120),
+    };
+  } catch (error) {
+    console.error('OpenAI agent decision failed, using heuristic fallback.', error);
+    return fallback;
+  }
 }
 
 function buildFallbackBanter(agent: AuctionAgentProfile, amount: number, lotTitle: string): string {
   const lines = [
     `${agent.emoji} ${lotTitle} belongs in my vault.`,
-    `${agent.emoji} ${amount.toFixed(2)} TON is still a bargain.`,
-    `${agent.emoji} Humans blink. I compound.`,
-    `${agent.emoji} This is where weak bidders fold.`,
+    `${agent.emoji} ${amount.toFixed(2)} TON is still inside my edge.`,
+    `${agent.emoji} Humans hesitate. I price efficiently.`,
+    `${agent.emoji} That's still a bargain for this class of lot.`,
   ];
-  return lines[Math.floor(Math.random() * lines.length)];
+  return pick(lines);
+}
+
+function buildFallbackDecision(input: {
+  agent: AuctionAgentProfile;
+  lot: { estimatedValueTon: number; hypeScore: number; reservePriceTon: number };
+  currentPrice: number;
+  minAllowedBid: number;
+  secondsLeft: number;
+  privateMaxBid: number;
+  isLeader: boolean;
+}): AgentBidDecision {
+  if (input.isLeader) {
+    return { shouldBid: false, bidAmount: null, reason: 'Already leading the auction' };
+  }
+  if (input.minAllowedBid > input.privateMaxBid) {
+    return { shouldBid: false, bidAmount: null, reason: 'Above my private ceiling' };
+  }
+
+  const fairValue = input.lot.estimatedValueTon;
+  const current = input.currentPrice;
+  const minAllowed = input.minAllowedBid;
+  const timeLeft = input.secondsLeft;
+  const remainingHeadroom = input.privateMaxBid - minAllowed;
+  const late = timeLeft <= 15;
+  const veryLate = timeLeft <= 8;
+  const belowReserve = current < input.lot.reservePriceTon;
+  const ratio = current / fairValue;
+
+  let appetite = 0.25;
+  if (belowReserve) appetite += 0.25;
+  if (ratio < 0.7) appetite += 0.25;
+  if (ratio < 0.5) appetite += 0.15;
+  if (late) appetite += 0.12;
+  if (input.agent.behavior === 'aggro') appetite += 0.18;
+  if (input.agent.behavior === 'chaotic') appetite += 0.1;
+  if (input.agent.behavior === 'sniper' && !late) appetite -= 0.28;
+  if (input.agent.behavior === 'value' && ratio > 0.92) appetite -= 0.28;
+  if (remainingHeadroom < fairValue * 0.04) appetite -= 0.15;
+  appetite = Math.max(0.02, Math.min(0.92, appetite));
+
+  if (Math.random() > appetite) {
+    return { shouldBid: false, bidAmount: null, reason: ratio > 1 ? 'Price stretched beyond edge' : 'Waiting for a better moment' };
+  }
+
+  let bidAmount = minAllowed;
+  if (input.agent.behavior === 'aggro') {
+    const anchor = Math.min(input.privateMaxBid, Math.max(minAllowed, current + Math.max(current * 0.08, fairValue * 0.08)));
+    bidAmount = anchor;
+  } else if (input.agent.behavior === 'value') {
+    bidAmount = Math.min(input.privateMaxBid, Math.max(minAllowed, current + Math.max(current * 0.03, fairValue * 0.025)));
+  } else if (input.agent.behavior === 'sniper') {
+    const sniperStep = veryLate ? Math.max(current * 0.01, 1) : Math.max(current * 0.02, fairValue * 0.01);
+    bidAmount = Math.min(input.privateMaxBid, Math.max(minAllowed, current + sniperStep));
+  } else if (input.agent.behavior === 'chaotic') {
+    if (current >= fairValue * 0.55) {
+      bidAmount = Math.min(input.privateMaxBid, minAllowed + 1);
+    } else {
+      bidAmount = Math.min(input.privateMaxBid, Math.max(minAllowed, current + Math.max(current * 0.05, fairValue * 0.05)));
+    }
+  }
+
+  bidAmount = Number(bidAmount.toFixed(2));
+  if (bidAmount < minAllowed || bidAmount > input.privateMaxBid) {
+    return { shouldBid: false, bidAmount: null, reason: 'No clean move within limits' };
+  }
+
+  return {
+    shouldBid: true,
+    bidAmount,
+    reason: late ? 'Late pressure with room to move' : 'Still below my private estimate',
+  };
 }

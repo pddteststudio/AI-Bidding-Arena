@@ -25,7 +25,10 @@ registerBidHandlers(bot);
 auctionService.subscribe(async (payload) => {
   for (const chatId of subscriberChats) {
     try {
-      await bot.api.sendMessage(chatId, payload.text, { parse_mode: 'HTML' });
+      await bot.api.sendMessage(chatId, payload.text, {
+        parse_mode: 'HTML',
+        reply_markup: payload.replyMarkup,
+      });
     } catch (error) {
       console.error(`Failed to broadcast to chat ${chatId}`, error);
     }

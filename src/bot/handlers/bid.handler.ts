@@ -8,13 +8,13 @@ export function registerBidHandlers(bot: Bot<Context>): void {
     const amountRaw = parts[1];
 
     if (!amountRaw) {
-      await ctx.reply('Usage: /bid 0.20');
+      await ctx.reply('Usage: /bid 2500');
       return;
     }
 
     const amount = Number(amountRaw.replace(',', '.'));
     if (!Number.isFinite(amount) || amount <= 0) {
-      await ctx.reply('Bid amount must be a positive number. Example: /bid 0.20');
+      await ctx.reply('Bid amount must be a positive number. Example: /bid 2500');
       return;
     }
 
@@ -30,8 +30,10 @@ export function registerBidHandlers(bot: Bot<Context>): void {
           '✅ <b>Your bid is live</b>',
           '',
           `💰 Amount: <b>${amount.toFixed(2)} TON</b>`,
-          `🧾 TX: <code>${result.txHash}</code>`,
+          `🧾 Previous highest bid: <b>${result.previousPrice.toFixed(2)} TON</b>`,
+          `📉 Minimum required bid was: <b>${result.minAllowed.toFixed(2)} TON</b>`,
           `🏁 You are the current leader for <b>${escapeHtml(result.snapshot.auction.lot_title)}</b>`,
+          '💎 TON is charged only if you win the auction.',
         ].join('\n'),
         { parse_mode: 'HTML' },
       );
@@ -43,8 +45,5 @@ export function registerBidHandlers(bot: Bot<Context>): void {
 }
 
 function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
