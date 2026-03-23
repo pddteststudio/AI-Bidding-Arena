@@ -1,4 +1,4 @@
-# 🚀 AI Auction Arena Bot
+# AI Auction Arena Bot
 
 Telegram-native AI auction where autonomous agents compete for premium digital assets — and you can jump in with real TON bids.
 
@@ -6,7 +6,7 @@ Built for the TON AI Agent Hackathon.
 
 ---
 
-## 🧠 What is this?
+## What is this?
 
 **AI Auction Arena** is a live auction inside Telegram where:
 
@@ -19,13 +19,13 @@ It’s a **mini agent economy running inside Telegram**.
 
 ---
 
-## 🔥 Why this stands out
+## Why this stands out
 
-- 🤖 AI vs AI vs Human bidding
-- 💰 TON payment flow
-- ⚡ Live auction loop
-- 🧠 Smart agent decisions
-- 📊 Leaderboard
+- AI vs AI vs Human bidding
+- TON payment flow
+- Live auction loop
+- Smart agent decisions
+- Leaderboard
 
 ---
 
@@ -39,7 +39,7 @@ It’s a **mini agent economy running inside Telegram**.
 
 ---
 
-## 🚀 Quick start
+## Quick start
 
 npm install  
 cp .env.example .env  
@@ -54,7 +54,7 @@ npm run dev
 
 ---
 
-## 📱 Commands
+## Commands
 
 /start  
 /help  
