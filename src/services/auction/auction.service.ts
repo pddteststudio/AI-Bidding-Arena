@@ -27,6 +27,8 @@ const AGENTS: AuctionAgentProfile[] = [
   { id: 'ai_chaos', name: 'ChaosNode', emoji: '⚡', behavior: 'chaotic', risk: 0.86, patience: 0.58, tone: 'unpredictable, playful, dramatic' },
 ];
 
+const AI_BID_CUTOFF_SECONDS = 5;
+
 const insertAuctionStmt = db.prepare(`
   INSERT INTO auctions (
     lot_title, lot_description, lot_style, lot_origin_story,
@@ -171,24 +173,42 @@ export class AuctionService {
     if (!liveAuction) {
       throw new Error('No live auction. Start one with /newauction.');
     }
+  
     if (liveAuction.status !== 'live') {
       throw new Error('Auction is not active.');
     }
-    if (Date.now() >= new Date(liveAuction.ends_at).getTime()) {
+  
+    const msLeft = new Date(liveAuction.ends_at).getTime() - Date.now();
+    const secondsLeft = Math.max(0, Math.ceil(msLeft / 1000));
+  
+    if (msLeft <= 0) {
       throw new Error('Auction is already ending. Please wait for settlement.');
     }
-
+  
+    if (input.bidderType === 'ai' && secondsLeft <= AI_BID_CUTOFF_SECONDS) {
+      throw new Error('AI bidding window is closed.');
+    }
+  
     const previousPrice = liveAuction.current_price;
     const minAllowed = this.getMinAllowedBid(previousPrice);
-
+  
     if (input.amount < minAllowed) {
-      throw new Error(`Bid rejected. Current highest bid: ${previousPrice.toFixed(2)} TON. Minimum allowed next bid: ${minAllowed.toFixed(2)} TON.`);
+      throw new Error(
+        `Bid rejected. Current highest bid: ${previousPrice.toFixed(2)} TON. Minimum allowed next bid: ${minAllowed.toFixed(2)} TON.`,
+      );
     }
-
-    if (liveAuction.highest_bidder_id === input.bidderId) {
-      throw new Error('You are already the highest bidder. Wait for a challenge.');
+  
+    if (
+      liveAuction.highest_bidder_id === input.bidderId &&
+      liveAuction.highest_bidder_name === input.bidderName
+    ) {
+      throw new Error(
+        input.bidderType === 'ai'
+          ? 'Agent is already the highest bidder.'
+          : 'You are already the highest bidder. Wait for a challenge.',
+      );
     }
-
+  
     const now = new Date().toISOString();
     db.transaction(() => {
       insertBidStmt.run(
@@ -200,12 +220,18 @@ export class AuctionService {
         input.txHash ?? null,
         now,
       );
-
-      updateAuctionBidStmt.run(Number(input.amount.toFixed(2)), input.bidderId, input.bidderName, liveAuction.id);
+  
+      updateAuctionBidStmt.run(
+        Number(input.amount.toFixed(2)),
+        input.bidderId,
+        input.bidderName,
+        liveAuction.id,
+      );
+  
       upsertUserStmt.run(input.bidderId, input.bidderName, input.bidderType, now, now);
       recordBidStatsStmt.run(Number(input.amount.toFixed(2)), now, input.bidderId);
     })();
-
+  
     return {
       snapshot: this.getSnapshot(liveAuction.id)!,
       previousPrice,
@@ -217,34 +243,52 @@ export class AuctionService {
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
     }
-
+  
     this.tickTimer = setInterval(async () => {
       if (this.tickInFlight) return;
       this.tickInFlight = true;
+  
       try {
         const liveAuction = this.getLiveAuction();
         if (!liveAuction) {
           this.stopTicking();
           return;
         }
-
+  
         const msLeft = new Date(liveAuction.ends_at).getTime() - Date.now();
+        const secsLeft = Math.max(0, Math.ceil(msLeft / 1000));
+  
         if (msLeft <= 0) {
           await this.finishAuction(liveAuction.id);
           return;
         }
-
-        const aiAction = await this.tryAiBid(liveAuction.id);
+  
+        let aiAction: string | null = null;
+  
+        if (secsLeft > AI_BID_CUTOFF_SECONDS) {
+          aiAction = await this.tryAiBid(liveAuction.id);
+        }
+  
         const fresh = this.getSnapshot(liveAuction.id);
         if (!fresh) return;
-        const secsLeft = Math.max(0, Math.ceil((new Date(fresh.auction.ends_at).getTime() - Date.now()) / 1000));
+  
+        const freshSecsLeft = Math.max(
+          0,
+          Math.ceil((new Date(fresh.auction.ends_at).getTime() - Date.now()) / 1000),
+        );
+  
+        if (freshSecsLeft <= 0) {
+          await this.finishAuction(liveAuction.id);
+          return;
+        }
+  
         await this.broadcast({
           type: 'auction_tick',
           text: aiAction
             ? `${aiAction}
-
-⏳ ${secsLeft}s left.`
-            : `⏳ Auction still live: ${secsLeft}s left. Current price: ${fresh.auction.current_price.toFixed(2)} TON.`,
+  
+  ⏳ ${freshSecsLeft}s left.`
+            : `⏳ Auction still live: ${freshSecsLeft}s left. Current price: ${fresh.auction.current_price.toFixed(2)} TON.`,
         });
       } finally {
         this.tickInFlight = false;
@@ -281,20 +325,52 @@ export class AuctionService {
   }
 
   private async tryAiBid(auctionId: number): Promise<string | null> {
-    const snapshot = this.getSnapshot(auctionId);
-    if (!snapshot) return null;
-    const auction = snapshot.auction;
-    const secondsLeft = Math.max(0, (new Date(auction.ends_at).getTime() - Date.now()) / 1000);
+    const initialSnapshot = this.getSnapshot(auctionId);
+    if (!initialSnapshot) return null;
+  
+    const initialAuction = initialSnapshot.auction;
+    const initialSecondsLeft = Math.max(
+      0,
+      Math.ceil((new Date(initialAuction.ends_at).getTime() - Date.now()) / 1000),
+    );
+  
+    if (initialSecondsLeft <= AI_BID_CUTOFF_SECONDS) {
+      return null;
+    }
+  
     const shuffled = [...AGENTS].sort(() => Math.random() - 0.5);
-
+  
     for (const agent of shuffled) {
       const currentSnapshot = this.getSnapshot(auctionId);
       if (!currentSnapshot) return null;
+  
       const live = currentSnapshot.auction;
+      if (live.status !== 'live') return null;
+  
+      const secondsLeft = Math.max(
+        0,
+        Math.ceil((new Date(live.ends_at).getTime() - Date.now()) / 1000),
+      );
+  
+      if (secondsLeft <= AI_BID_CUTOFF_SECONDS) {
+        return null;
+      }
+  
+      const isLeader =
+        live.highest_bidder_id === agent.id &&
+        live.highest_bidder_name === agent.name;
+  
+      if (isLeader) {
+        continue;
+      }
+  
       const minAllowedBid = this.getMinAllowedBid(live.current_price);
       const privateMaxBid = this.buildAgentPrivateMax(live, agent);
-      const isLeader = live.highest_bidder_id === agent.id;
-
+  
+      if (minAllowedBid > privateMaxBid) {
+        continue;
+      }
+  
       const decision = await decideAgentBid({
         agent,
         lot: {
@@ -312,13 +388,50 @@ export class AuctionService {
         privateMaxBid,
         isLeader,
       });
-
-      if (!decision.shouldBid || !decision.bidAmount) continue;
-      const boundedAmount = this.normalizeAgentBidAmount(agent, live.current_price, minAllowedBid, decision.bidAmount, privateMaxBid, secondsLeft, live.estimated_value_ton);
-      if (boundedAmount === null) continue;
-
+  
+      if (!decision.shouldBid || !decision.bidAmount) {
+        continue;
+      }
+  
+      const refreshedSnapshot = this.getSnapshot(auctionId);
+      if (!refreshedSnapshot) return null;
+  
+      const refreshedAuction = refreshedSnapshot.auction;
+      if (refreshedAuction.status !== 'live') return null;
+  
+      const refreshedSecondsLeft = Math.max(
+        0,
+        Math.ceil((new Date(refreshedAuction.ends_at).getTime() - Date.now()) / 1000),
+      );
+  
+      if (refreshedSecondsLeft <= AI_BID_CUTOFF_SECONDS) {
+        return null;
+      }
+  
+      const refreshedMinAllowed = this.getMinAllowedBid(refreshedAuction.current_price);
+      const refreshedPrivateMaxBid = this.buildAgentPrivateMax(refreshedAuction, agent);
+  
+      if (decision.bidAmount < refreshedMinAllowed) {
+        continue;
+      }
+  
+      const boundedAmount = this.normalizeAgentBidAmount(
+        agent,
+        refreshedAuction.current_price,
+        refreshedMinAllowed,
+        decision.bidAmount,
+        refreshedPrivateMaxBid,
+        refreshedSecondsLeft,
+        refreshedAuction.estimated_value_ton,
+      );
+  
+      if (boundedAmount === null) {
+        continue;
+      }
+  
+      let placed;
       try {
-        this.placeBid({
+        placed = this.placeBid({
           bidderId: agent.id,
           bidderName: agent.name,
           bidderType: 'ai',
@@ -328,12 +441,26 @@ export class AuctionService {
       } catch {
         continue;
       }
-
-      const banter = await generateAgentBanter(agent, boundedAmount, live.lot_title);
+  
+      const verifySnapshot = this.getSnapshot(auctionId);
+      if (!verifySnapshot) return null;
+  
+      const verifyAuction = verifySnapshot.auction;
+  
+      if (
+        verifyAuction.highest_bidder_id !== agent.id ||
+        verifyAuction.highest_bidder_name !== agent.name ||
+        Number(verifyAuction.current_price.toFixed(2)) !== Number(boundedAmount.toFixed(2))
+      ) {
+        continue;
+      }
+  
+      const banter = await generateAgentBanter(agent, boundedAmount, verifyAuction.lot_title);
+  
       return `${agent.emoji} <b>${agent.name}</b> bids <b>${boundedAmount.toFixed(2)} TON</b>
-<i>${escapeHtml(decision.reason)} • ${escapeHtml(banter)}</i>`;
+  <i>${escapeHtml(decision.reason)} • ${escapeHtml(banter)}</i>`;
     }
-
+  
     return null;
   }
 
@@ -347,25 +474,53 @@ export class AuctionService {
     fairValue: number,
   ): number | null {
     if (minAllowed > privateMaxBid) return null;
-
+    if (secondsLeft <= AI_BID_CUTOFF_SECONDS) return null;
+  
     let amount = Math.max(minAllowed, Number(requestedAmount.toFixed(2)));
     const early = secondsLeft > env.auctionDurationSec * 0.55;
     const late = secondsLeft <= 15;
-
+    const veryLate = secondsLeft <= 8;
+  
     if (agent.behavior === 'chaotic') {
-      amount = currentPrice >= fairValue * 0.55 ? minAllowed + 1 : Math.max(amount, currentPrice + Math.max(currentPrice * 0.05, fairValue * 0.05));
+      amount =
+        currentPrice >= fairValue * 0.55
+          ? minAllowed + 1
+          : Math.max(amount, currentPrice + Math.max(currentPrice * 0.05, fairValue * 0.05));
     } else if (agent.behavior === 'aggro' && early) {
-      amount = Math.max(amount, currentPrice + Math.max(currentPrice * 0.08, fairValue * 0.08));
+      amount = Math.max(
+        amount,
+        currentPrice + Math.max(currentPrice * 0.06, fairValue * 0.035),
+      );
     } else if (agent.behavior === 'value') {
-      amount = Math.max(minAllowed, Math.min(amount, currentPrice + Math.max(currentPrice * 0.03, fairValue * 0.025)));
-    } else if (agent.behavior === 'sniper' && late) {
-      amount = Math.max(minAllowed, Math.min(amount, minAllowed + Math.max(currentPrice * 0.01, 1)));
+      amount = Math.max(
+        minAllowed,
+        Math.min(amount, currentPrice + Math.max(currentPrice * 0.03, fairValue * 0.025)),
+      );
+    } else if (agent.behavior === 'sniper') {
+      if (!late) return null;
+  
+      if (veryLate) {
+        amount = Math.max(minAllowed, minAllowed + 1);
+      } else {
+        amount = Math.max(minAllowed, Math.min(amount, minAllowed + Math.max(currentPrice * 0.003, 0.5)));
+      }
     }
-
+  
     amount = Number(amount.toFixed(2));
-    if (amount > privateMaxBid) {
-      amount = Number(privateMaxBid.toFixed(2));
-    }
+  
+    const maxJumpPct =
+      agent.behavior === 'aggro'
+        ? 0.14
+        : agent.behavior === 'chaotic'
+          ? 0.18
+          : agent.behavior === 'sniper'
+            ? 0.08
+            : 0.1;
+  
+    const maxAllowedByJump = Number((currentPrice * (1 + maxJumpPct)).toFixed(2));
+    amount = Math.min(amount, maxAllowedByJump, Number(privateMaxBid.toFixed(2)));
+    amount = Number(Math.max(minAllowed, amount).toFixed(2));
+  
     if (amount < minAllowed || amount > privateMaxBid) return null;
     return amount;
   }
